@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ from executor import (
 from json_grammar import get_json_grammar
 from preparser import build_fallback_plan, preparse
 from prompts import build_chat_prompt, build_planner_prompt
+
+log = logging.getLogger("3dex_agent")
 
 
 class SceneTracker:
@@ -332,7 +335,22 @@ def _ask_llm_for_plan(
     raise ValueError("Model geçerli plan üretemedi.")
 
 
-def run_repl(debug: bool = False, real_3dx: bool = False) -> None:
+def _setup_logging(debug: bool) -> None:
+    logger = logging.getLogger("3dex_agent")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.DEBUG if debug else logging.INFO)
+        fmt = logging.Formatter(
+            "[%(levelname)s] %(message)s" if not debug
+            else "[%(levelname)s][%(funcName)s] %(message)s"
+        )
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+
+
+def run_repl(debug: bool = False, real_3dx: bool = False, dry_run: bool = False) -> None:
+    _setup_logging(debug)
     llm = _load_llm()
 
     connector: Optional[ThreeDXExecutor] = None
@@ -351,7 +369,7 @@ def run_repl(debug: bool = False, real_3dx: bool = False) -> None:
             print("[INFO] Simülasyon moduna geçiliyor.")
             real_3dx = False
 
-    mode_label = "3DEXPERIENCE" if real_3dx else "SIMULATION"
+    mode_label = "DRY-RUN" if dry_run else ("3DEXPERIENCE" if real_3dx else "SIMULATION")
 
     print("========================================")
     print("  Offline LLM CAD Komut Yorumlayıcısı")
@@ -436,7 +454,9 @@ def run_repl(debug: bool = False, real_3dx: bool = False) -> None:
             print("-----------------------------")
 
         try:
-            if use_connector and connector is not None:
+            if dry_run:
+                messages = execute_plan(plan, dry_run=True)
+            elif use_connector and connector is not None:
                 messages = execute_plan(plan, simulate=False, connector=connector)
             else:
                 messages = execute_plan(plan, simulate=True)
@@ -484,9 +504,15 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Gerçek 3DEXPERIENCE'a COM ile bağlan (Windows, pywin32 gerekli).",
     )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="COM çağrısı yapmadan hangi adımların çalışacağını göster.",
+    )
 
     args = parser.parse_args(argv)
-    run_repl(debug=args.debug, real_3dx=args.real_3dx)
+    run_repl(debug=args.debug, real_3dx=args.real_3dx, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

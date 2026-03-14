@@ -17,10 +17,12 @@ echo.
 echo Mod secin:
 echo   1 - Simulasyon modu (3DEXPERIENCE gereksiz)
 echo   2 - Gercek 3DEXPERIENCE modu (COM baglanti)
+echo   3 - Dry-run modu (COM adimlarini goster, calistirma)
 echo.
-set /p choice="Seciminiz (1-2): "
+set /p choice="Seciminiz (1-3): "
 
 if "%choice%"=="1" "%PYEXE%" "%~dp0chat.py" --debug
 if "%choice%"=="2" "%PYEXE%" "%~dp0chat.py" --3dx --debug
+if "%choice%"=="3" "%PYEXE%" "%~dp0chat.py" --dry-run --debug
 
 pause

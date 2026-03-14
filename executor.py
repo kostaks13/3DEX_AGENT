@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, NamedTuple, Optional, Set
 
 try:
     import win32com.client  # type: ignore
 except Exception:  # pragma: no cover - Windows/pywin32 yoksa
     win32com = None
+
+
+log = logging.getLogger("3dex_agent")
 
 
 SUPPORTED_ACTIONS = {
@@ -37,16 +41,12 @@ class ThreeDXConnectionError(Exception):
         return self.message
 
 
-def validate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    LLM'den gelen JSON planını doğrular.
-    - Yapı
-    - intent değeri
-    - operations listesi
-    - her bir operation için zorunlu alanlar
-    - desteklenmeyen action isimleri
-    """
+# ────────────────────────────────────────────────────────────────────
+# Validation
+# ────────────────────────────────────────────────────────────────────
 
+
+def validate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(plan, dict):
         raise ValidationError("Plan JSON nesnesi olmalı.")
 
@@ -58,7 +58,6 @@ def validate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(operations, list) or not operations:
         raise ValidationError("'operations' dolu bir liste olmalı.")
 
-    # Nesne isimlerini takip ederek bağımlılıkları kontrol edeceğiz
     defined_points: Set[str] = set()
     defined_planes: Set[str] = set()
     defined_sketches: Set[str] = set()
@@ -177,15 +176,44 @@ def validate_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     return plan
 
 
+# ────────────────────────────────────────────────────────────────────
+# CATIAContext — tek seferde önbelleğe alınan COM nesneleri
+# ────────────────────────────────────────────────────────────────────
+
+
+class CATIAContext(NamedTuple):
+    app: Any
+    editor: Any
+    part: Any
+    hsf: Any          # HybridShapeFactory
+    sf: Any           # ShapeFactory
+    geom_set: Any     # aktif Geometrical Set (HybridBody)
+
+
+# ────────────────────────────────────────────────────────────────────
+# ThreeDXExecutor
+# ────────────────────────────────────────────────────────────────────
+
+
 class ThreeDXExecutor:
     """
     Gerçek 3DEXPERIENCE / CATIA COM entegrasyonu.
     Windows'ta çalışır, pywin32 gerektirir.
+
+    Temel varsayım: CATIA açık, ActiveEditor var, ActiveObject bir Part,
+    kullanıcı doğru Part Design penceresinde.
+
+    NOT: Bu sınıfta hiçbir yerde ActiveDocument, Documents.Open veya
+    Documents.Add gibi V5 kalıntısı kullanılmaz. 3DEXPERIENCE tarafında
+    giriş noktası ActiveEditor, kalıcılık tarafı PLM mantığıdır.
     """
+
+    _PART_TYPE_NAMES = ("Part", "VPMRepReference", "DELFmiFunctionalModel")
 
     def __init__(self, progid: Optional[str] = None) -> None:
         self._progid = progid or os.getenv("THREEDX_PROGID", "CATIA.Application")
-        self._app = None
+        self._app: Any = None
+        self._deferred_update = False
 
     # ── Bağlantı ───────────────────────────────────────────────────────
 
@@ -205,134 +233,300 @@ class ThreeDXExecutor:
             raise ThreeDXConnectionError(
                 "Dispatch başarılı ama Application nesnesi None döndü."
             )
+        log.debug("COM bağlantısı kuruldu: %s", self._progid)
 
-    # ── Dahili yardımcılar ─────────────────────────────────────────────
+    # ── Preflight — tek noktadan kontrol ──────────────────────────────
 
-    def _get_active_editor(self):
-        if self._app is None:
+    def preflight(self) -> CATIAContext:
+        """
+        Tüm ön koşulları tek seferde doğrular ve CATIAContext döndürür:
+          1. CATIA bağlantısı var mı
+          2. ActiveEditor alınabiliyor mu
+          3. ActiveObject gerçekten Part mi
+          4. HybridShapeFactory alınabiliyor mu
+          5. ShapeFactory alınabiliyor mu
+          6. En az bir Geometrical Set bulunabiliyor mu
+        Herhangi biri başarısız olursa anlamlı hata fırlatır.
+        """
+        app = self._app
+        if app is None:
             raise ThreeDXConnectionError(
                 "3DEXPERIENCE uygulamasına bağlantı yok. Önce connect() çağırın."
             )
 
-        editor = self._app.ActiveEditor
+        try:
+            editor = app.ActiveEditor
+        except Exception as e:
+            raise ThreeDXConnectionError(f"ActiveEditor alınamadı: {e}") from e
         if editor is None:
             raise ThreeDXConnectionError("Aktif editor bulunamadı.")
-        return editor
 
-    def _get_active_part(self):
-        editor = self._get_active_editor()
-        part = editor.ActiveObject
-        if part is None:
-            raise RuntimeError("Aktif editor içinde Part nesnesi bulunamadı.")
-        return part
+        try:
+            obj = editor.ActiveObject
+        except Exception as e:
+            raise RuntimeError(f"ActiveEditor.ActiveObject alınamadı: {e}") from e
+        if obj is None:
+            raise RuntimeError("Aktif editor içinde nesne bulunamadı (ActiveObject=None).")
 
-    def _get_hybrid_shape_factory(self, part):
-        factory = part.HybridShapeFactory
-        if factory is None:
-            raise RuntimeError("HybridShapeFactory alınamadı.")
-        return factory
+        type_name = ""
+        try:
+            type_name = str(type(obj).__name__)
+        except Exception:
+            pass
 
-    def _get_shape_factory(self, part):
-        factory = part.ShapeFactory
-        if factory is None:
-            raise RuntimeError("ShapeFactory alınamadı.")
-        return factory
+        is_part = type_name in self._PART_TYPE_NAMES
+        if not is_part:
+            try:
+                _ = obj.HybridShapeFactory
+                is_part = True
+            except Exception:
+                pass
+        if not is_part:
+            raise RuntimeError(
+                f"ActiveObject bir Part değil (tip: {type_name!r}). "
+                "Part Design editöründe açık bir Part olduğundan emin olun."
+            )
 
-    def _get_hybrid_bodies(self, part):
-        hybrid_bodies = part.HybridBodies
-        if hybrid_bodies is None:
+        try:
+            hsf = obj.HybridShapeFactory
+        except Exception as e:
+            raise RuntimeError(f"HybridShapeFactory alınamadı: {e}") from e
+        if hsf is None:
+            raise RuntimeError("HybridShapeFactory alınamadı (None döndü).")
+
+        try:
+            sf = obj.ShapeFactory
+        except Exception as e:
+            raise RuntimeError(f"ShapeFactory alınamadı: {e}") from e
+        if sf is None:
+            raise RuntimeError("ShapeFactory alınamadı (None döndü).")
+
+        geom_set = self._get_geometrical_set(obj)
+
+        ctx = CATIAContext(
+            app=app, editor=editor, part=obj, hsf=hsf, sf=sf, geom_set=geom_set
+        )
+        log.debug(
+            "Preflight OK — part_type=%s, geom_set=%s",
+            type_name,
+            self._safe_name(geom_set),
+        )
+        return ctx
+
+    # ── Dahili yardımcılar ─────────────────────────────────────────────
+
+    @staticmethod
+    def _safe_name(com_obj: Any) -> str:
+        try:
+            return str(com_obj.Name)
+        except Exception:
+            return "?"
+
+    def _get_geometrical_set(self, part: Any, set_name: str = "Geometrical Set.1") -> Any:
+        """
+        Geometrical set bulma stratejisi:
+          1. Verilen isimle eşleşen set'i bul
+          2. Yoksa ilk mevcut HybridBody'yi kullan
+          3. O da yoksa yeni set oluştur
+        """
+        try:
+            hbodies = part.HybridBodies
+        except Exception as e:
+            raise RuntimeError(
+                f"Part.HybridBodies koleksiyonuna erişilemedi: {e}"
+            ) from e
+        if hbodies is None:
             raise RuntimeError("Part içinde HybridBodies koleksiyonu alınamadı.")
-        return hybrid_bodies
-
-    def _get_or_create_hybrid_body(self, part, body_name: str = "LLM_Geometry"):
-        hybrid_bodies = self._get_hybrid_bodies(part)
 
         count = 0
         try:
-            count = hybrid_bodies.Count
+            count = hbodies.Count
         except Exception:
             count = 0
 
         for i in range(1, count + 1):
-            body = hybrid_bodies.Item(i)
             try:
-                if str(body.Name) == body_name:
+                body = hbodies.Item(i)
+                if str(body.Name) == set_name:
+                    log.debug("Geometrical set bulundu: %s", set_name)
                     return body
             except Exception:
-                pass
+                continue
 
         if count > 0:
             try:
-                first_body = hybrid_bodies.Item(1)
-                if first_body is not None:
-                    return first_body
+                first = hbodies.Item(1)
+                log.debug(
+                    "İsimli set bulunamadı (%s); ilk set kullanılıyor: %s",
+                    set_name, self._safe_name(first),
+                )
+                return first
             except Exception:
                 pass
 
-        body = hybrid_bodies.Add()
-        body.Name = body_name
-        return body
-
-    def _iter_hybrid_shapes(self, part):
-        hybrid_bodies = self._get_hybrid_bodies(part)
-
-        body_count = 0
         try:
-            body_count = hybrid_bodies.Count
+            body = hbodies.Add()
+            body.Name = set_name
+            log.debug("Yeni geometrical set oluşturuldu: %s", set_name)
+            return body
+        except Exception as e:
+            raise RuntimeError(
+                f"Yeni Geometrical Set oluşturulamadı: {e}"
+            ) from e
+
+    def _find_shape_in_set(self, geom_set: Any, shape_name: str) -> Any:
+        try:
+            return geom_set.HybridShapes.Item(shape_name)
         except Exception:
-            body_count = 0
+            return None
 
-        for i in range(1, body_count + 1):
-            body = hybrid_bodies.Item(i)
-            shapes = None
+    def _find_hybrid_shape_by_name(self, part: Any, shape_name: str):
+        """
+        Tüm geometrical set'lerde isme göre arar.
+        Aynı isimde birden fazla nesne varsa açık hata verir.
+        Döndürür: (geom_set, shape) veya (None, None).
+        """
+        try:
+            hbodies = part.HybridBodies
+        except Exception:
+            return None, None
+        if hbodies is None:
+            return None, None
+
+        count = 0
+        try:
+            count = hbodies.Count
+        except Exception:
+            return None, None
+
+        matches: list[tuple[Any, Any]] = []
+
+        for i in range(1, count + 1):
             try:
-                shapes = body.HybridShapes
+                gset = hbodies.Item(i)
             except Exception:
-                shapes = None
-            if shapes is None:
                 continue
+            shape = self._find_shape_in_set(gset, shape_name)
+            if shape is not None:
+                matches.append((gset, shape))
 
-            shape_count = 0
-            try:
-                shape_count = shapes.Count
-            except Exception:
-                shape_count = 0
+        if len(matches) == 0:
+            return None, None
+        if len(matches) == 1:
+            return matches[0]
 
-            for j in range(1, shape_count + 1):
-                shape = shapes.Item(j)
-                yield body, shape
+        set_names = [self._safe_name(m[0]) for m in matches]
+        raise RuntimeError(
+            f"'{shape_name}' ismi birden fazla Geometrical Set'te bulundu: "
+            f"{set_names}. Lütfen benzersiz isimler kullanın."
+        )
 
-    def _find_hybrid_shape_by_name(self, part, shape_name: str):
-        for body, shape in self._iter_hybrid_shapes(part):
-            try:
-                if str(shape.Name) == shape_name:
-                    return body, shape
-            except Exception:
-                pass
-        return None, None
-
-    def _check_name_collision(self, part, name: str) -> None:
-        _body, shape = self._find_hybrid_shape_by_name(part, name)
+    def _check_name_collision(self, part: Any, name: str) -> None:
+        _gset, shape = self._find_hybrid_shape_by_name(part, name)
         if shape is not None:
             raise RuntimeError(f"İsim çakışması: '{name}' zaten mevcut.")
 
-    def _append_and_update(self, part, target_body, shape) -> None:
-        target_body.AppendHybridShape(shape)
-        part.InWorkObject = shape
-        part.Update()
+    def _create_reference(self, part: Any, obj: Any) -> Any:
+        try:
+            ref = part.CreateReferenceFromObject(obj)
+        except Exception as e:
+            raise RuntimeError(
+                f"CreateReferenceFromObject başarısız: {e}"
+            ) from e
+        if ref is None:
+            raise RuntimeError("CreateReferenceFromObject None döndü.")
+        return ref
+
+    def _append_and_update(self, part: Any, geom_set: Any, shape: Any) -> None:
+        try:
+            geom_set.AppendHybridShape(shape)
+        except Exception as e:
+            raise RuntimeError(f"AppendHybridShape başarısız: {e}") from e
+
+        try:
+            part.InWorkObject = shape
+        except Exception:
+            pass
+
+        if not self._deferred_update:
+            try:
+                part.Update()
+            except Exception as e:
+                raise RuntimeError(f"Part.Update() başarısız: {e}") from e
+            log.debug("Part.Update() çağrıldı")
+
+    # ── Batch modu ─────────────────────────────────────────────────────
+
+    def begin_batch(self) -> None:
+        self._deferred_update = True
+        log.debug("Batch modu başlatıldı — Update() erteleniyor")
+
+    def finish_batch(self) -> None:
+        self._deferred_update = False
+        ctx = self.preflight()
+        try:
+            ctx.part.Update()
+        except Exception as e:
+            raise RuntimeError(f"Batch Update() başarısız: {e}") from e
+        log.debug("Batch Update() tamamlandı")
+
+    # ── Service erişimi ────────────────────────────────────────────────
+
+    def get_service(self, service_name: str) -> Any:
+        """editor.GetService — editor-level service (örn. PLMPropagateService)."""
+        ctx = self.preflight()
+        try:
+            svc = ctx.editor.GetService(service_name)
+        except Exception as e:
+            raise RuntimeError(
+                f"Editor servisi alınamadı ('{service_name}'): {e}"
+            ) from e
+        if svc is None:
+            raise RuntimeError(f"Editor servisi None döndü: '{service_name}'")
+        return svc
+
+    def get_session_service(self, service_name: str) -> Any:
+        """CATIA.GetSessionService — session-level service (örn. PLMSearch)."""
+        if self._app is None:
+            raise ThreeDXConnectionError("Bağlantı yok. Önce connect() çağırın.")
+        try:
+            svc = self._app.GetSessionService(service_name)
+        except Exception as e:
+            raise RuntimeError(
+                f"Session servisi alınamadı ('{service_name}'): {e}"
+            ) from e
+        if svc is None:
+            raise RuntimeError(f"Session servisi None döndü: '{service_name}'")
+        return svc
+
+    def save(self) -> None:
+        """
+        3DEXPERIENCE'ta değişiklikleri veritabanına kaydet.
+        Yerel dosya save mantığı yoktur; PLMPropagateService kullanılır.
+        """
+        try:
+            propagate_svc = self.get_service("PLMPropagateService")
+            propagate_svc.PLMPropagate()
+            log.info("PLMPropagate ile kayıt tamamlandı")
+        except Exception as e:
+            raise RuntimeError(
+                f"PLMPropagate ile kayıt başarısız: {e}\n"
+                "3DEXPERIENCE oturumunuzun veritabanına yazma izni olduğundan emin olun."
+            ) from e
 
     # ── Aksiyon: create_point ──────────────────────────────────────────
 
     def create_point(self, name: str, x: float, y: float, z: float) -> None:
         try:
-            part = self._get_active_part()
-            hybrid_shape_factory = self._get_hybrid_shape_factory(part)
-            target_body = self._get_or_create_hybrid_body(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            point = hybrid_shape_factory.AddNewPointCoord(float(x), float(y), float(z))
-            point.Name = name
-            self._append_and_update(part, target_body, point)
+            pt = ctx.hsf.AddNewPointCoord(float(x), float(y), float(z))
+            if pt is None:
+                raise RuntimeError("AddNewPointCoord None döndü.")
+            pt.Name = name
+            self._append_and_update(ctx.part, ctx.geom_set, pt)
+            log.debug("create_point OK — name=%s, geom_set=%s", name, self._safe_name(ctx.geom_set))
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -342,26 +536,28 @@ class ThreeDXExecutor:
 
     def create_line_between_points(self, name: str, p1: str, p2: str) -> None:
         try:
-            part = self._get_active_part()
-            hybrid_shape_factory = self._get_hybrid_shape_factory(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            body1, point1 = self._find_hybrid_shape_by_name(part, p1)
-            body2, point2 = self._find_hybrid_shape_by_name(part, p2)
+            gset1, p1_obj = self._find_hybrid_shape_by_name(ctx.part, p1)
+            _gset2, p2_obj = self._find_hybrid_shape_by_name(ctx.part, p2)
 
-            if point1 is None:
+            if p1_obj is None:
                 raise RuntimeError(f"'{p1}' isimli nokta part içinde bulunamadı.")
-            if point2 is None:
+            if p2_obj is None:
                 raise RuntimeError(f"'{p2}' isimli nokta part içinde bulunamadı.")
 
-            target_body = body1 or body2 or self._get_or_create_hybrid_body(part)
+            ref1 = self._create_reference(ctx.part, p1_obj)
+            ref2 = self._create_reference(ctx.part, p2_obj)
 
-            ref1 = part.CreateReferenceFromObject(point1)
-            ref2 = part.CreateReferenceFromObject(point2)
-
-            line = hybrid_shape_factory.AddNewLinePtPt(ref1, ref2)
+            line = ctx.hsf.AddNewLinePtPt(ref1, ref2)
+            if line is None:
+                raise RuntimeError("AddNewLinePtPt None döndü.")
             line.Name = name
-            self._append_and_update(part, target_body, line)
+
+            target = gset1 or ctx.geom_set
+            self._append_and_update(ctx.part, target, line)
+            log.debug("create_line OK — name=%s, p1=%s, p2=%s", name, p1, p2)
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -373,29 +569,29 @@ class ThreeDXExecutor:
         self, name: str, through_point: str, normal: List[float]
     ) -> None:
         try:
-            part = self._get_active_part()
-            hybrid_shape_factory = self._get_hybrid_shape_factory(part)
-            target_body = self._get_or_create_hybrid_body(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            _body, pt_shape = self._find_hybrid_shape_by_name(part, through_point)
+            _gset, pt_shape = self._find_hybrid_shape_by_name(ctx.part, through_point)
             if pt_shape is None:
                 raise RuntimeError(
                     f"'{through_point}' isimli nokta part içinde bulunamadı."
                 )
 
-            pt_ref = part.CreateReferenceFromObject(pt_shape)
+            pt_ref = self._create_reference(ctx.part, pt_shape)
 
-            plane = hybrid_shape_factory.AddNewPlane1Curve1Point(pt_ref, pt_ref)
-
-            direction = hybrid_shape_factory.AddNewDirectionByCoord(
+            direction = ctx.hsf.AddNewDirectionByCoord(
                 float(normal[0]), float(normal[1]), float(normal[2])
             )
-            plane_by_normal = hybrid_shape_factory.AddNewPlaneNormal(
-                direction, pt_ref
-            )
-            plane_by_normal.Name = name
-            self._append_and_update(part, target_body, plane_by_normal)
+            if direction is None:
+                raise RuntimeError("AddNewDirectionByCoord None döndü.")
+
+            plane = ctx.hsf.AddNewPlaneNormal(direction, pt_ref)
+            if plane is None:
+                raise RuntimeError("AddNewPlaneNormal None döndü.")
+            plane.Name = name
+            self._append_and_update(ctx.part, ctx.geom_set, plane)
+            log.debug("create_plane OK — name=%s, through=%s", name, through_point)
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -405,22 +601,25 @@ class ThreeDXExecutor:
 
     def create_sketch(self, name: str, on_plane: str) -> None:
         try:
-            part = self._get_active_part()
-            target_body = self._get_or_create_hybrid_body(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            _body, plane_shape = self._find_hybrid_shape_by_name(part, on_plane)
+            _gset, plane_shape = self._find_hybrid_shape_by_name(ctx.part, on_plane)
             if plane_shape is None:
                 raise RuntimeError(
                     f"'{on_plane}' isimli düzlem part içinde bulunamadı."
                 )
 
-            plane_ref = part.CreateReferenceFromObject(plane_shape)
-            sketches = target_body.HybridSketches
+            plane_ref = self._create_reference(ctx.part, plane_shape)
+            sketches = ctx.geom_set.HybridSketches
             sketch = sketches.Add(plane_ref)
+            if sketch is None:
+                raise RuntimeError("HybridSketches.Add None döndü.")
             sketch.Name = name
 
-            part.Update()
+            if not self._deferred_update:
+                ctx.part.Update()
+            log.debug("create_sketch OK — name=%s, on_plane=%s", name, on_plane)
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -432,27 +631,28 @@ class ThreeDXExecutor:
         self, name: str, center_point: str, radius: float
     ) -> None:
         try:
-            part = self._get_active_part()
-            hybrid_shape_factory = self._get_hybrid_shape_factory(part)
-            target_body = self._get_or_create_hybrid_body(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            _body, pt_shape = self._find_hybrid_shape_by_name(part, center_point)
+            _gset, pt_shape = self._find_hybrid_shape_by_name(ctx.part, center_point)
             if pt_shape is None:
                 raise RuntimeError(
                     f"'{center_point}' isimli nokta part içinde bulunamadı."
                 )
 
-            pt_ref = part.CreateReferenceFromObject(pt_shape)
+            pt_ref = self._create_reference(ctx.part, pt_shape)
 
-            xy_plane_ref = part.OriginElements.PlaneXY
-            plane_ref = part.CreateReferenceFromObject(xy_plane_ref)
+            xy_plane = ctx.part.OriginElements.PlaneXY
+            plane_ref = self._create_reference(ctx.part, xy_plane)
 
-            circle = hybrid_shape_factory.AddNewCircleCtrRad(
+            circle = ctx.hsf.AddNewCircleCtrRad(
                 pt_ref, plane_ref, False, float(radius)
             )
+            if circle is None:
+                raise RuntimeError("AddNewCircleCtrRad None döndü.")
             circle.Name = name
-            self._append_and_update(part, target_body, circle)
+            self._append_and_update(ctx.part, ctx.geom_set, circle)
+            log.debug("create_circle OK — name=%s, center=%s, r=%s", name, center_point, radius)
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -464,21 +664,24 @@ class ThreeDXExecutor:
         self, name: str, from_sketch: str, length: float
     ) -> None:
         try:
-            part = self._get_active_part()
-            shape_factory = self._get_shape_factory(part)
-            self._check_name_collision(part, name)
+            ctx = self.preflight()
+            self._check_name_collision(ctx.part, name)
 
-            _body, sketch_shape = self._find_hybrid_shape_by_name(part, from_sketch)
+            _gset, sketch_shape = self._find_hybrid_shape_by_name(ctx.part, from_sketch)
             if sketch_shape is None:
                 raise RuntimeError(
                     f"'{from_sketch}' isimli sketch/profile part içinde bulunamadı."
                 )
 
-            sketch_ref = part.CreateReferenceFromObject(sketch_shape)
-
-            pad = shape_factory.AddNewPad(sketch_ref, float(length))
+            sketch_ref = self._create_reference(ctx.part, sketch_shape)
+            pad = ctx.sf.AddNewPad(sketch_ref, float(length))
+            if pad is None:
+                raise RuntimeError("AddNewPad None döndü.")
             pad.Name = name
-            part.Update()
+
+            if not self._deferred_update:
+                ctx.part.Update()
+            log.debug("extrude_pad OK — name=%s, from=%s, len=%s", name, from_sketch, length)
         except Exception as e:
             if isinstance(e, (ThreeDXConnectionError, RuntimeError)):
                 raise
@@ -486,22 +689,60 @@ class ThreeDXExecutor:
 
     # ── Yardımcı: mevcut geometrileri listele ──────────────────────────
 
-    def get_point(self, name: str):
-        part = self._get_active_part()
-        _body, shape = self._find_hybrid_shape_by_name(part, name)
+    def _iter_all_shapes(self, part: Any):
+        try:
+            hbodies = part.HybridBodies
+        except Exception:
+            return
+        if hbodies is None:
+            return
+
+        count = 0
+        try:
+            count = hbodies.Count
+        except Exception:
+            return
+
+        for i in range(1, count + 1):
+            try:
+                geom_set = hbodies.Item(i)
+            except Exception:
+                continue
+            try:
+                shapes = geom_set.HybridShapes
+            except Exception:
+                continue
+            if shapes is None:
+                continue
+
+            shape_count = 0
+            try:
+                shape_count = shapes.Count
+            except Exception:
+                continue
+
+            for j in range(1, shape_count + 1):
+                try:
+                    yield geom_set, shapes.Item(j)
+                except Exception:
+                    continue
+
+    def get_point(self, name: str) -> Any:
+        ctx = self.preflight()
+        _gset, shape = self._find_hybrid_shape_by_name(ctx.part, name)
         if shape is None:
             raise RuntimeError(f"'{name}' isimli geometri part içinde bulunamadı.")
         return shape
 
     def geometry_exists(self, name: str) -> bool:
-        part = self._get_active_part()
-        _body, shape = self._find_hybrid_shape_by_name(part, name)
+        ctx = self.preflight()
+        _gset, shape = self._find_hybrid_shape_by_name(ctx.part, name)
         return shape is not None
 
     def list_geometry_names(self) -> List[str]:
-        part = self._get_active_part()
+        ctx = self.preflight()
         names: List[str] = []
-        for _body, shape in self._iter_hybrid_shapes(part):
+        for _gset, shape in self._iter_all_shapes(ctx.part):
             try:
                 names.append(str(shape.Name))
             except Exception:
@@ -509,10 +750,9 @@ class ThreeDXExecutor:
         return names
 
     def list_objects(self) -> Dict[str, Dict[str, Any]]:
-        """Sahnedeki nesneleri dict olarak döndürür."""
-        part = self._get_active_part()
+        ctx = self.preflight()
         result: Dict[str, Dict[str, Any]] = {}
-        for _body, shape in self._iter_hybrid_shapes(part):
+        for _gset, shape in self._iter_all_shapes(ctx.part):
             try:
                 sname = str(shape.Name)
                 stype = "unknown"
@@ -535,7 +775,6 @@ class ThreeDXExecutor:
         return result
 
     def dump_summary(self) -> str:
-        """Sahne özetini string olarak döndürür."""
         objects = self.list_objects()
         if not objects:
             return "(boş sahne)"
@@ -545,15 +784,101 @@ class ThreeDXExecutor:
         return "\n".join(lines)
 
 
+# ────────────────────────────────────────────────────────────────────
+# Dry-run — COM adımlarını çalıştırmadan göster
+# ────────────────────────────────────────────────────────────────────
+
+
+def _dry_run_describe(op: Dict[str, Any]) -> List[str]:
+    """Tek bir operasyon için hangi COM adımlarının çalışacağını döndürür."""
+    action = op["action"]
+    name = op.get("name", "?")
+    steps: List[str] = []
+
+    steps.append(f"  preflight() → app, editor, part, hsf, sf, geom_set")
+
+    if action == "create_point":
+        x, y, z = op.get("coordinates", [0, 0, 0])
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  hsf.AddNewPointCoord({x}, {y}, {z})")
+        steps.append(f"  pt.Name = '{name}'")
+        steps.append(f"  geom_set.AppendHybridShape(pt)")
+        steps.append(f"  part.InWorkObject = pt")
+
+    elif action == "create_line_between_points":
+        pnames = op.get("point_names", ["?", "?"])
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{pnames[0]}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{pnames[1]}')")
+        steps.append(f"  ref1 = part.CreateReferenceFromObject(p1_obj)")
+        steps.append(f"  ref2 = part.CreateReferenceFromObject(p2_obj)")
+        steps.append(f"  hsf.AddNewLinePtPt(ref1, ref2)")
+        steps.append(f"  line.Name = '{name}'")
+        steps.append(f"  geom_set.AppendHybridShape(line)")
+        steps.append(f"  part.InWorkObject = line")
+
+    elif action == "create_plane":
+        tp = op.get("through_point", "?")
+        n = op.get("normal", [0, 0, 0])
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{tp}')")
+        steps.append(f"  ref = part.CreateReferenceFromObject(pt_shape)")
+        steps.append(f"  hsf.AddNewDirectionByCoord({n[0]}, {n[1]}, {n[2]})")
+        steps.append(f"  hsf.AddNewPlaneNormal(direction, ref)")
+        steps.append(f"  plane.Name = '{name}'")
+        steps.append(f"  geom_set.AppendHybridShape(plane)")
+
+    elif action == "create_sketch":
+        op_name = op.get("on_plane", "?")
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{op_name}')")
+        steps.append(f"  ref = part.CreateReferenceFromObject(plane_shape)")
+        steps.append(f"  geom_set.HybridSketches.Add(ref)")
+        steps.append(f"  sketch.Name = '{name}'")
+
+    elif action == "create_circle":
+        cp = op.get("center_point", "?")
+        r = op.get("radius", 0)
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{cp}')")
+        steps.append(f"  pt_ref = part.CreateReferenceFromObject(pt_shape)")
+        steps.append(f"  plane_ref = part.CreateReferenceFromObject(OriginElements.PlaneXY)")
+        steps.append(f"  hsf.AddNewCircleCtrRad(pt_ref, plane_ref, False, {r})")
+        steps.append(f"  circle.Name = '{name}'")
+        steps.append(f"  geom_set.AppendHybridShape(circle)")
+
+    elif action == "extrude_pad":
+        fs = op.get("from_sketch", "?")
+        ln = op.get("length", 0)
+        steps.append(f"  _check_name_collision(part, '{name}')")
+        steps.append(f"  _find_hybrid_shape_by_name(part, '{fs}')")
+        steps.append(f"  ref = part.CreateReferenceFromObject(sketch_shape)")
+        steps.append(f"  sf.AddNewPad(ref, {ln})")
+        steps.append(f"  pad.Name = '{name}'")
+
+    steps.append(f"  part.Update()")
+    return steps
+
+
+# ────────────────────────────────────────────────────────────────────
+# Plan çalıştırıcı
+# ────────────────────────────────────────────────────────────────────
+
+
 def execute_plan(
     plan: Dict[str, Any],
     simulate: bool = True,
     connector: Optional[ThreeDXExecutor] = None,
+    dry_run: bool = False,
 ) -> List[str]:
     """
     Planı çalıştırır.
     - simulate=True  → sadece terminal simülasyonu
-    - simulate=False → connector verilmişse gerçek 3DEXPERIENCE çağrıları
+    - simulate=False → connector ile gerçek 3DEXPERIENCE çağrıları
+    - dry_run=True   → COM çağrısı yapmadan hangi adımların çalışacağını göster
+
+    Birden fazla operasyonda batch modu kullanılır: her adımda ayrı
+    Update() yerine tüm geometri eklendikten sonra tek bir Update().
     """
 
     plan = validate_plan(plan)
@@ -561,70 +886,104 @@ def execute_plan(
 
     messages: List[str] = []
 
-    if simulate or connector is None:
+    # ── Dry-run modu ──────────────────────────────────────────────
+    if dry_run:
+        messages.append("[DRY-RUN] Aşağıdaki COM adımları çalıştırılacaktı:")
+        for idx, op in enumerate(operations):
+            action = op["action"]
+            name = op.get("name", "?")
+            messages.append(f"")
+            messages.append(f"── Adım {idx + 1}: {action} '{name}' ──")
+            for step in _dry_run_describe(op):
+                messages.append(step)
+        if len(operations) > 1:
+            messages.append(f"")
+            messages.append("── Batch modu: tüm adımlar tamamlandıktan sonra tek part.Update() ──")
+        return messages
+
+    # ── Normal çalıştırma ─────────────────────────────────────────
+    use_real = not simulate and connector is not None
+
+    if not use_real:
         messages.append(
             "[SIMULATION] 3DEXPERIENCE bağlantısı yerine terminal çıktısı kullanılıyor."
         )
 
-    for op in operations:
-        action = op["action"]
+    batch_mode = use_real and len(operations) > 1
+    if batch_mode:
+        connector.begin_batch()  # type: ignore[union-attr]
 
-        if simulate or connector is None:
-            if action == "create_point":
-                msg = _simulate_create_point(op)
-            elif action == "create_line_between_points":
-                msg = _simulate_create_line_between_points(op)
-            elif action == "create_plane":
-                msg = _simulate_create_plane(op)
-            elif action == "create_sketch":
-                msg = _simulate_create_sketch(op)
-            elif action == "create_circle":
-                msg = _simulate_create_circle(op)
-            elif action == "extrude_pad":
-                msg = _simulate_extrude_pad(op)
-            else:
-                raise ValidationError(f"Desteklenmeyen action: {action!r}")
-            messages.append(msg)
-            continue
+    try:
+        for op in operations:
+            action = op["action"]
 
-        name = op["name"]
-        try:
-            if action == "create_point":
-                x, y, z = op["coordinates"]
-                connector.create_point(name, float(x), float(y), float(z))
-                messages.append(f"[OK] create_point {name} ({x}, {y}, {z})")
-            elif action == "create_line_between_points":
-                p1, p2 = op["point_names"]
-                connector.create_line_between_points(name, p1, p2)
-                messages.append(f"[OK] create_line_between_points {name} ({p1}, {p2})")
-            elif action == "create_plane":
-                connector.create_plane(name, op["through_point"], op["normal"])
-                messages.append(
-                    f"[OK] create_plane {name} through {op['through_point']} "
-                    f"normal {op['normal']}"
-                )
-            elif action == "create_sketch":
-                connector.create_sketch(name, op["on_plane"])
-                messages.append(f"[OK] create_sketch {name} on {op['on_plane']}")
-            elif action == "create_circle":
-                connector.create_circle(name, op["center_point"], float(op["radius"]))
-                messages.append(
-                    f"[OK] create_circle {name} at {op['center_point']} r={op['radius']}"
-                )
-            elif action == "extrude_pad":
-                connector.extrude_pad(name, op["from_sketch"], float(op["length"]))
-                messages.append(
-                    f"[OK] extrude_pad {name} from {op['from_sketch']} len={op['length']}"
-                )
-            else:
-                raise ValidationError(f"Desteklenmeyen action: {action!r}")
-        except (ValidationError, ThreeDXConnectionError):
-            raise
-        except Exception as exc:
-            messages.append(f"[HATA] {action} {name}: {exc}")
-            raise
+            if not use_real:
+                if action == "create_point":
+                    msg = _simulate_create_point(op)
+                elif action == "create_line_between_points":
+                    msg = _simulate_create_line_between_points(op)
+                elif action == "create_plane":
+                    msg = _simulate_create_plane(op)
+                elif action == "create_sketch":
+                    msg = _simulate_create_sketch(op)
+                elif action == "create_circle":
+                    msg = _simulate_create_circle(op)
+                elif action == "extrude_pad":
+                    msg = _simulate_extrude_pad(op)
+                else:
+                    raise ValidationError(f"Desteklenmeyen action: {action!r}")
+                messages.append(msg)
+                continue
+
+            name = op["name"]
+            try:
+                if action == "create_point":
+                    x, y, z = op["coordinates"]
+                    connector.create_point(name, float(x), float(y), float(z))  # type: ignore[union-attr]
+                    messages.append(f"[OK] create_point {name} ({x}, {y}, {z})")
+                elif action == "create_line_between_points":
+                    p1, p2 = op["point_names"]
+                    connector.create_line_between_points(name, p1, p2)  # type: ignore[union-attr]
+                    messages.append(f"[OK] create_line_between_points {name} ({p1}, {p2})")
+                elif action == "create_plane":
+                    connector.create_plane(name, op["through_point"], op["normal"])  # type: ignore[union-attr]
+                    messages.append(
+                        f"[OK] create_plane {name} through {op['through_point']} "
+                        f"normal {op['normal']}"
+                    )
+                elif action == "create_sketch":
+                    connector.create_sketch(name, op["on_plane"])  # type: ignore[union-attr]
+                    messages.append(f"[OK] create_sketch {name} on {op['on_plane']}")
+                elif action == "create_circle":
+                    connector.create_circle(name, op["center_point"], float(op["radius"]))  # type: ignore[union-attr]
+                    messages.append(
+                        f"[OK] create_circle {name} at {op['center_point']} r={op['radius']}"
+                    )
+                elif action == "extrude_pad":
+                    connector.extrude_pad(name, op["from_sketch"], float(op["length"]))  # type: ignore[union-attr]
+                    messages.append(
+                        f"[OK] extrude_pad {name} from {op['from_sketch']} len={op['length']}"
+                    )
+                else:
+                    raise ValidationError(f"Desteklenmeyen action: {action!r}")
+            except (ValidationError, ThreeDXConnectionError):
+                raise
+            except Exception as exc:
+                messages.append(f"[HATA] {action} {name}: {exc}")
+                raise
+    finally:
+        if batch_mode:
+            try:
+                connector.finish_batch()  # type: ignore[union-attr]
+            except Exception as e:
+                messages.append(f"[HATA] Toplu Update başarısız: {e}")
 
     return messages
+
+
+# ────────────────────────────────────────────────────────────────────
+# Simülasyon fonksiyonları
+# ────────────────────────────────────────────────────────────────────
 
 
 def _simulate_create_point(op: Dict[str, Any]) -> str:
@@ -670,6 +1029,4 @@ def _simulate_extrude_pad(op: Dict[str, Any]) -> str:
 
 
 def pretty_print_plan(plan: Dict[str, Any]) -> str:
-    """Debug / --debug modu için JSON'u okunabilir string'e çevirir."""
-
     return json.dumps(plan, ensure_ascii=False, indent=2)
