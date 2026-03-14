@@ -76,6 +76,8 @@ Yani kurulum tarafında sizin yapmanız gereken tek şey:
 Çalıştırma (Kullanım Kılavuzu)
 ------------------------------
 
+`run.bat` çalıştırıldığında üç mod sunulur: **1** Simülasyon, **2** Gerçek 3DEXPERIENCE, **3** Dry-run.
+
 ### 1. Simülasyon Modu (3DEXPERIENCE olmadan test)
 
 Bu modda **hiçbir gerçek CAD komutu çalıştırılmaz**; yalnızca terminalde
@@ -85,7 +87,7 @@ Adımlar:
 
 1. `Offline_LLMV3` klasörünü açın.
 2. `run.bat` dosyasına çift tıklayın.
-3. Menüden **1 - Simulasyon modu** seçin.
+3. Menüden **1 - Simulasyon modu** seçin (3DEXPERIENCE gereksiz).
 
 Terminalde şuna benzer bir ekran görürsünüz:
 
@@ -146,6 +148,28 @@ Adımlar:
 3. Part dokümanı aktif editorde açıkken (makro yazacağınız normal durum):
 4. `Offline_LLMV3` klasöründe `run.bat`’a çift tıklayın.
 5. Menüden **2 - Gercek 3DEXPERIENCE modu (COM baglanti)** seçin.
+
+### 3. Dry-run Modu (COM adımlarını gösterme, çalıştırmama)
+
+LLM komutu anlar ve JSON planı üretir; ancak **hiçbir COM çağrısı yapılmaz**.
+Bunun yerine terminalde hangi COM adımlarının çalışacağı listelenir.
+İş PC’sinde ilk denemelerde “yanlış parse mı, COM tarafı mı?” ayırımını
+yapmak için kullanışlıdır.
+
+- `run.bat` → **3 - Dry-run modu** seçin.
+- Veya komut satırından: `python chat.py --dry-run --debug`
+
+Örnek çıktı:
+
+```text
+[DRY-RUN] Aşağıdaki COM adımları çalıştırılacaktı:
+
+── Adım 1: create_point 'P1' ──
+  preflight() → app, editor, part, hsf, sf, geom_set
+  _check_name_collision(part, 'P1')
+  hsf.AddNewPointCoord(0, 0, 0)
+  ...
+```
 
 Başarılı bağlantıda terminal şöyle der:
 
@@ -240,9 +264,17 @@ Mimari Özeti
 3. **Executor (`ThreeDXExecutor`)**
    - Sadece **onaylanmış** planları çalıştırır.
    - COM üzerinden 3DEXPERIENCE’a bağlanır (`win32com.client.Dispatch`).
-   - Tüm geometri isimlerinde çakışmayı engeller (önce kendisi kontrol ediyor).
+   - **Preflight:** Her komut öncesi tek bir `preflight()` ile CATIA bağlantısı, ActiveEditor, ActiveObject (Part), HybridShapeFactory, ShapeFactory ve aktif Geometrical Set tek seferde doğrulanır ve `CATIAContext` olarak önbelleğe alınır; tüm aksiyonlar bu context üzerinden çalışır.
+   - İsim çözümleme: Nokta/geometri araması **tüm HybridBodies** içinde yapılır; aynı isimde birden fazla nesne varsa açık hata verilir.
+   - Tüm geometri isimlerinde çakışmayı engeller.
+   - **Kayıt:** Geometri üretimi için `part.Update()` yeterlidir; veritabanına gerçek kayıt için `save()` → `PLMPropagateService.PLMPropagate` kullanılır (3DEXPERIENCE PLM mantığı).
+   - Genişleme: `get_service(ad)` (editor-level) ve `get_session_service(ad)` (session-level) ile ileride measure, search, screenshot vb. servisler eklenebilir.
 
-4. **Güvenlik**
+4. **Loglama**
+   - **Kullanıcı:** Her komut sonrası kısa sonuç satırları (örn. `[OK] create_point P1 ...`).
+   - **Debug:** `--debug` ile çalıştırıldığında `3dex_agent` logger devreye girer; preflight, geom_set adı, Update çağrıları gibi teknik ayrıntılar stderr’e yazılır. İnternet olmayan iş PC’sinde hata ayıklama için faydalıdır.
+
+5. **Güvenlik**
    - LLM hiçbir zaman direkt COM fonksiyonu seçmiyor; sadece:
      - “`create_point` ile nokta oluştur”
      - “`create_line_between_points` ile çizgi oluştur”
