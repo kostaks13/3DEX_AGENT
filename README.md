@@ -1,6 +1,14 @@
 Offline LLM CAD Komut Yorumlayıcısı
 ===================================
 
+<p align="center">
+  <img src="logo.png" alt="3DEX_AGENT logo" width="200" />
+</p>
+
+*GitHub’da reponun sosyal önizleme görseli olarak kullanmak için: **Settings → General → Social preview** bölümüne `logo.png` yükleyin.*
+
+---
+
 Bu proje, **internet bağlantısı olmadan**, Windows iş bilgisayarında çalışan,
 **doğal dil → JSON plan → 3DEXPERIENCE/CATIA komut zinciri** sunan bir CLI aracıdır.
 
