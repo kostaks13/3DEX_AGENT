@@ -1,0 +1,62 @@
+================================================================
+  Offline LLM CAD Komut Yorumlayıcısı — Örnek Komutlar
+================================================================
+
+Aşağıdaki komutları terminalde aynen yazarak deneyebilirsiniz.
+
+Çalıştırma:
+  python\python.exe chat.py --debug              (simülasyon)
+  python\python.exe chat.py --debug --3dx        (gerçek 3DEXPERIENCE)
+
+----------------------------------------------------------------
+ÖRNEK 1 — İki nokta + çizgi (temel)
+----------------------------------------------------------------
+Komut>  orijine nokta at, 30 30 30'a bir nokta daha at, iki noktadan geçen bir line çiz
+
+Beklenen:
+  P1 (0,0,0)  →  P2 (30,30,30)  →  L1 (P1–P2)
+
+----------------------------------------------------------------
+ÖRNEK 2 — Özel isimli noktalar + çizgi
+----------------------------------------------------------------
+Komut>  50 0 0'a PA noktasını koy, 0 50 0'a PB noktasını koy, bu iki noktadan L_AB çizgisini çiz
+
+Beklenen:
+  PA (50,0,0)  →  PB (0,50,0)  →  L_AB (PA–PB)
+
+----------------------------------------------------------------
+ÖRNEK 3 — Düzlem + sketch zinciri
+----------------------------------------------------------------
+Komut>  orijine P0 noktasını koy, bu noktadan geçen ve Z eksenine dik bir düzlem oluştur, bu düzlemde SK1 isminde sketch aç
+
+Beklenen:
+  P0 (0,0,0)  →  Plane1 (P0, normal Z)  →  SK1 (Plane1 üzerinde)
+
+----------------------------------------------------------------
+ÖRNEK 4 — Daire + extrude (silindir)
+----------------------------------------------------------------
+Komut>  orijine CC noktasını koy, CC merkezli 40 mm yarıçaplı bir daire çiz ve bunu 80 mm extrude et
+
+Beklenen:
+  CC (0,0,0)  →  C1 (merkez CC, r=40)  →  PAD1 (C1'den, 80mm)
+
+----------------------------------------------------------------
+ÖRNEK 5 — Eksik bilgi (soru sorması gereken)
+----------------------------------------------------------------
+Komut>  line çiz
+
+Beklenen:
+  [SORU] Hangi iki noktanın koordinatlarını kullanayım?
+
+----------------------------------------------------------------
+EK: sahne özeti
+----------------------------------------------------------------
+Komut>  sahne
+
+Sahnedeki tüm nesneleri listeler:
+  P1 [point]  coordinates=[0.0, 0.0, 0.0]
+  P2 [point]  coordinates=[30.0, 30.0, 30.0]
+  L1 [line]   start=... end=...
+  ...
+
+================================================================

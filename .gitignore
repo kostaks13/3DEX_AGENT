@@ -1,0 +1,24 @@
+# Embedded Python (çok büyük; Windows'ta ayrı kurulur veya proje klasörüne kopyalanır)
+python/
+
+# LLM model dosyaları (.gguf, GitHub 100MB limitini aşar)
+models/*.gguf
+*.gguf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
